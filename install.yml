@@ -1,0 +1,242 @@
+```yaml
+---
+- name: STB Automation
+  hosts: targets
+  become: true
+
+  vars_prompt:
+    - name: monitoring_password
+      prompt: "Enter monitoring password"
+      private: true
+
+  tasks:
+
+    - name: Update APT cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - python3
+          - python3-bcrypt
+        state: present
+
+    - name: Create Docker keyring directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: >
+          deb [arch={{
+          ansible_architecture |
+          replace('x86_64', 'amd64') |
+          replace('aarch64', 'arm64')
+          }}
+          signed-by=/etc/apt/keyrings/docker.asc]
+          https://download.docker.com/linux/ubuntu
+          {{ ansible_distribution_release }} stable
+        filename: docker
+        state: present
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Enable Docker
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Check CasaOS
+      stat:
+        path: /usr/bin/casaos
+      register: casaos_binary
+
+    - name: Install CasaOS
+      shell: curl -fsSL https://get.casaos.io | bash
+      when: not casaos_binary.stat.exists
+
+    - name: Create Portainer directory
+      file:
+        path: /opt/portainer
+        state: directory
+        mode: '0755'
+
+    - name: Create Portainer compose file
+      copy:
+        dest: /opt/portainer/docker-compose.yml
+        mode: '0644'
+        content: |
+          services:
+            portainer:
+              image: portainer/portainer-ce:lts
+              container_name: portainer
+              restart: unless-stopped
+              ports:
+                - "9443:9443"
+                - "8000:8000"
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock
+                - ./portainer_data:/data
+
+    - name: Start Portainer
+      command:
+        cmd: docker compose up -d
+        chdir: /opt/portainer
+
+    - name: Generate Prometheus bcrypt password
+      shell: |
+        python3 -c "import bcrypt, os; print(
+        bcrypt.hashpw(
+        os.environ['PASSWORD'].encode(),
+        bcrypt.gensalt()
+        ).decode())"
+      environment:
+        PASSWORD: "{{ monitoring_password }}"
+      register: prometheus_password_hash
+      changed_when: false
+      no_log: true
+
+    - name: Create monitoring directory
+      file:
+        path: /opt/monitoring
+        state: directory
+        mode: '0755'
+
+    - name: Create Prometheus data directory
+      file:
+        path: /opt/monitoring/monitoring-data/prometheus_data
+        state: directory
+        owner: '65534'
+        group: '65534'
+        mode: '0755'
+
+    - name: Create Prometheus config
+      copy:
+        dest: /opt/monitoring/prometheus.yml
+        mode: '0644'
+        content: |
+          global:
+            scrape_interval: 15s
+
+          scrape_configs:
+            - job_name: prometheus
+              static_configs:
+                - targets:
+                    - prometheus:9090
+
+            - job_name: node-exporter
+              static_configs:
+                - targets:
+                    - node-exporter:9100
+
+            - job_name: cadvisor
+              static_configs:
+                - targets:
+                    - cadvisor:8080
+
+    - name: Create Prometheus web config
+      copy:
+        dest: /opt/monitoring/web-config.yml
+        mode: '0644'
+        content: |
+          basic_auth_users:
+            monitor: "{{ prometheus_password_hash.stdout }}"
+
+    - name: Create Grafana provisioning directory
+      file:
+        path: /opt/monitoring/grafana/provisioning/datasources
+        state: directory
+        mode: '0755'
+
+    - name: Create Grafana datasource
+      copy:
+        dest: /opt/monitoring/grafana/provisioning/datasources/prometheus.yml
+        mode: '0644'
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: http://prometheus:9090
+              basicAuth: true
+              basicAuthUser: monitor
+              basicAuthPassword: "{{ monitoring_password }}"
+              isDefault: true
+
+    - name: Create monitoring compose file
+      copy:
+        dest: /opt/monitoring/docker-compose.yml
+        mode: '0644'
+        content: |
+          services:
+            cadvisor:
+              image: gcr.io/cadvisor/cadvisor:v0.47.1
+              container_name: cadvisor
+              restart: unless-stopped
+              ports:
+                - "8080:8080"
+              volumes:
+                - /:/rootfs:ro
+                - /var/run:/var/run:ro
+                - /sys:/sys:ro
+                - /var/lib/docker:/var/lib/docker:ro
+
+            node-exporter:
+              image: prom/node-exporter:v1.7.0
+              container_name: node-exporter
+              restart: unless-stopped
+              ports:
+                - "9100:9100"
+
+            prometheus:
+              image: prom/prometheus:v3.0.0
+              container_name: prometheus
+              restart: unless-stopped
+              ports:
+                - "9090:9090"
+
+            grafana:
+              image: grafana/grafana:11.5.0
+              container_name: grafana
+              restart: unless-stopped
+              ports:
+                - "3000:3000"
+              environment:
+                GF_SECURITY_ADMIN_USER: monitor
+                GF_SECURITY_ADMIN_PASSWORD: "{{ monitoring_password }}"
+              volumes:
+                - ./grafana/provisioning:/etc/grafana/provisioning
+                - grafana_data:/var/lib/grafana
+
+          volumes:
+            grafana_data:
+
+    - name: Start Monitoring
+      command:
+        cmd: docker compose up -d
+        chdir: /opt/monitoring
+```
